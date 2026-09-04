@@ -10,24 +10,24 @@ permissions:
   contents: write
 
 jobs:
+  # ---------------------------------------------------------------- 1. Register
   register-dataset:
+    name: Register Dataset
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
       - name: Install Dependencies
         run: pip install -r tourism_project/requirements.txt
-      - name: Register Dataset
+      - name: Validate and Register Dataset
         run: python tourism_project/model_building/data_register.py
-      - name: Upload Registered Dataset
-        uses: actions/upload-artifact@v4
-        with:
-          name: registered-data
-          path: tourism_project/data/tourism.csv
 
+  # ------------------------------------------------------------- 2. Preparation
   data-prep:
+    name: Data Preparation
     needs: register-dataset
     runs-on: ubuntu-latest
     steps:
@@ -35,9 +35,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
       - name: Install Dependencies
         run: pip install -r tourism_project/requirements.txt
-      - name: Run Data Preparation
+      - name: Clean Data and Build Train/Test Splits
         run: python tourism_project/model_building/prep.py
       - name: Upload Train Test Splits
         uses: actions/upload-artifact@v4
@@ -48,8 +49,11 @@ jobs:
             Xtest.csv
             ytrain.csv
             ytest.csv
+          retention-days: 7
 
+  # ---------------------------------------------------------------- 3. Training
   model-training:
+    name: Model Building and Training
     needs: data-prep
     runs-on: ubuntu-latest
     steps:
@@ -57,22 +61,96 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
       - name: Install Dependencies
         run: pip install -r tourism_project/requirements.txt
       - name: Download Train Test Splits
         uses: actions/download-artifact@v4
         with:
           name: data-splits
-      - name: Start MLflow Server
-        run: |
-          nohup mlflow ui --host 0.0.0.0 --port 5000 &
-          sleep 5
-      - name: Model Building
+      - name: Tune, Evaluate and Save the Best Model
         run: python tourism_project/model_building/train.py
-      - name: Commit Trained Model
+      - name: Upload MLflow Tracking Data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-tracking
+          path: |
+            mlflow.db
+            mlartifacts/
+            cv_results.csv
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Commit Trained Model to Repository
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add tourism_project/deployment/best_tourism_model.joblib
-          git commit -m "Add trained model [skip ci]" || echo "No changes to commit"
-          git push
+          git add -f tourism_project/deployment/best_tourism_model.joblib
+          if git diff --staged --quiet; then
+            echo "Model unchanged; nothing to commit."
+          else
+            git commit -m "Update trained model [skip ci]"
+            git pull --rebase origin ${{ github.ref_name }}
+            git push origin HEAD:${{ github.ref_name }}
+            echo "Trained model committed to ${{ github.ref_name }}."
+          fi
+
+  # -------------------------------------------------------------- 4. Deployment
+  deploy:
+    name: Verify Deployment
+    needs: model-training
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install Deployment Dependencies
+        run: pip install -r tourism_project/deployment/requirements.txt
+      - name: Verify Deployment Files Are Present
+        run: |
+          test -f tourism_project/deployment/app.py
+          test -f tourism_project/deployment/requirements.txt
+          test -f tourism_project/deployment/best_tourism_model.joblib
+          echo "All deployment files are present on main."
+      - name: Smoke Test the Committed Model
+        run: |
+          python - <<'PYCODE'
+          import joblib
+          import pandas as pd
+
+          model = joblib.load("tourism_project/deployment/best_tourism_model.joblib")
+
+          # One row shaped exactly like the Streamlit app builds it.
+          sample = pd.DataFrame([{
+              "Age": 35.0,
+              "TypeofContact": "Self Enquiry",
+              "CityTier": 1,
+              "DurationOfPitch": 13.0,
+              "Occupation": "Salaried",
+              "Gender": "Female",
+              "NumberOfPersonVisiting": 3,
+              "NumberOfFollowups": 4.0,
+              "ProductPitched": "Deluxe",
+              "PreferredPropertyStar": 3.0,
+              "MaritalStatus": "Single",
+              "NumberOfTrips": 3.0,
+              "Passport": 1,
+              "PitchSatisfactionScore": 3,
+              "OwnCar": 0,
+              "NumberOfChildrenVisiting": 1.0,
+              "Designation": "Manager",
+              "MonthlyIncome": 23000.0,
+          }])
+
+          probability = model.predict_proba(sample)[0, 1]
+          print(f"Smoke test passed. Purchase probability: {probability:.4f}")
+          PYCODE
+      - name: Deployment Notice
+        run: |
+          echo "Model committed to main."
+          echo "Streamlit Community Cloud watches this branch and redeploys"
+          echo "tourism_project/deployment/app.py automatically."
